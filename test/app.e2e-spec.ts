@@ -7,6 +7,7 @@ import { AppModule } from '../src/app.module';
 import { HcmSimulatorAppModule } from '../src/hcm-simulator-app.module';
 import { TimeOffRequestStatus } from '../src/common/status.enum';
 import {
+  Balance,
   BalanceSyncEvent,
   HcmSimulatorAppliedRequest,
   RequestEvent,
@@ -20,6 +21,7 @@ describe('ExampleHR Time-Off Microservice', () => {
   let hcmDataSource: DataSource;
   let requestEvents: Repository<RequestEvent>;
   let syncEvents: Repository<BalanceSyncEvent>;
+  let balancesRepository: Repository<Balance>;
   let requestsRepository: Repository<TimeOffRequest>;
   let hcmAppliedRequests: Repository<HcmSimulatorAppliedRequest>;
   let timeOffServer: any;
@@ -44,6 +46,7 @@ describe('ExampleHR Time-Off Microservice', () => {
     hcmDataSource = hcmApp.get(DataSource);
     requestEvents = timeOffDataSource.getRepository(RequestEvent);
     syncEvents = timeOffDataSource.getRepository(BalanceSyncEvent);
+    balancesRepository = timeOffDataSource.getRepository(Balance);
     requestsRepository = timeOffDataSource.getRepository(TimeOffRequest);
     hcmAppliedRequests = hcmDataSource.getRepository(HcmSimulatorAppliedRequest);
   });
@@ -95,6 +98,9 @@ describe('ExampleHR Time-Off Microservice', () => {
     batchId: string,
     balances: Array<{ employeeId: string; locationId: string; balanceDays: number; externalVersion?: string }>,
   ) {
+    for (const balance of balances) {
+      await seedHcm(balance.employeeId, balance.locationId, balance.balanceDays);
+    }
     return request(timeOffServer).post('/sync/hcm/balances').send({ batchId, balances }).expect(201);
   }
 
@@ -108,6 +114,10 @@ describe('ExampleHR Time-Off Microservice', () => {
         requestedBy: 'emp-1',
         ...extra,
       });
+  }
+
+  function wait(milliseconds: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
   }
 
   it('returns health status for both services', async () => {
@@ -191,6 +201,32 @@ describe('ExampleHR Time-Off Microservice', () => {
     expect(balance.body.balanceDays).toBe(10);
     expect(balance.body.reservedDays).toBe(3);
     expect(balance.body.availableDays).toBe(7);
+    expect(balance.body.isFresh).toBe(true);
+    expect(balance.body.isStale).toBe(false);
+    expect(balance.body.staleAfterSeconds).toBe(300);
+    expect(balance.body.balanceAgeSeconds).toEqual(expect.any(Number));
+  });
+
+  it('refreshes employee-facing balance display when fresh data is requested', async () => {
+    await syncBalance('batch-display-freshness', 20);
+    await balancesRepository.update(
+      { employeeId: 'emp-1', locationId: 'loc-1' },
+      { lastSyncedAt: new Date(Date.now() - 10 * 60 * 1000) },
+    );
+    await seedHcm('emp-1', 'loc-1', 0);
+
+    const cached = await request(timeOffServer).get('/balances/emp-1/loc-1').expect(200);
+    expect(cached.body.balanceDays).toBe(20);
+    expect(cached.body.availableDays).toBe(20);
+    expect(cached.body.isFresh).toBe(false);
+    expect(cached.body.isStale).toBe(true);
+
+    const fresh = await request(timeOffServer).get('/balances/emp-1/loc-1').query({ fresh: true }).expect(200);
+    expect(fresh.body.balanceDays).toBe(0);
+    expect(fresh.body.availableDays).toBe(0);
+    expect(fresh.body.source).toBe('HCM_REALTIME');
+    expect(fresh.body.isFresh).toBe(true);
+    expect(fresh.body.isStale).toBe(false);
   });
 
   it('creates request with sufficient local availability and rejects insufficient availability', async () => {
@@ -225,6 +261,18 @@ describe('ExampleHR Time-Off Microservice', () => {
     expect(balance.body.availableDays).toBe(2);
   });
 
+  it('refreshes HCM before creating so stale high cache cannot register an invalid request', async () => {
+    await syncBalance('batch-high-local', 10);
+    await seedHcm('emp-1', 'loc-1', 2);
+
+    await createRequest(8).expect(409);
+    expect(await requestsRepository.count()).toBe(0);
+
+    const balance = await request(timeOffServer).get('/balances/emp-1/loc-1').expect(200);
+    expect(balance.body.balanceDays).toBe(2);
+    expect(balance.body.availableDays).toBe(2);
+  });
+
   it('returns 503 when required HCM refresh is unavailable', async () => {
     await request(hcmServer).post('/hcm-simulator/config').send({ isUnavailable: true }).expect(201);
 
@@ -244,6 +292,7 @@ describe('ExampleHR Time-Off Microservice', () => {
 
     await createRequest(1).expect(503);
     expect(await requestsRepository.count()).toBe(0);
+    await wait(60);
   });
 
   it('counts APPROVING requests as reservations', async () => {
@@ -372,6 +421,43 @@ describe('ExampleHR Time-Off Microservice', () => {
     expect(requestRecord.body.status).toBe(TimeOffRequestStatus.Pending);
   });
 
+  it('refreshes HCM for manager validation before approval', async () => {
+    await seedHcm('emp-1', 'loc-1', 10);
+    const created = await createRequest(8).expect(201);
+    await seedHcm('emp-1', 'loc-1', 2);
+
+    const validation = await request(timeOffServer)
+      .post(`/time-off-requests/${created.body.id}/validate`)
+      .expect(201);
+
+    expect(validation.body.status).toBe(TimeOffRequestStatus.Pending);
+    expect(validation.body.requestedDays).toBe(8);
+    expect(validation.body.hcmBalanceDays).toBe(2);
+    expect(validation.body.availableDays).toBe(-6);
+    expect(validation.body.canApprove).toBe(false);
+    expect(validation.body.validationReason).toBe('HCM balance is insufficient for this request');
+    expect(validation.body.source).toBe('HCM_REALTIME');
+    expect(validation.body.isFresh).toBe(true);
+    expect(validation.body.isStale).toBe(false);
+    expect(validation.body.staleAfterSeconds).toBe(300);
+
+    const requestRecord = await request(timeOffServer).get(`/time-off-requests/${created.body.id}`).expect(200);
+    expect(requestRecord.body.status).toBe(TimeOffRequestStatus.Pending);
+  });
+
+  it('fails manager validation safely when HCM is unavailable', async () => {
+    await seedHcm('emp-1', 'loc-1', 10);
+    const created = await createRequest(2).expect(201);
+    await request(hcmServer).post('/hcm-simulator/config').send({ isUnavailable: true }).expect(201);
+
+    await request(timeOffServer)
+      .post(`/time-off-requests/${created.body.id}/validate`)
+      .expect(503);
+
+    const requestRecord = await request(timeOffServer).get(`/time-off-requests/${created.body.id}`).expect(200);
+    expect(requestRecord.body.status).toBe(TimeOffRequestStatus.Pending);
+  });
+
   it('fails approval before apply when HCM apply behavior is unreliable', async () => {
     await seedHcm('emp-1', 'loc-1', 10);
     const created = await createRequest(6).expect(201);
@@ -398,6 +484,7 @@ describe('ExampleHR Time-Off Microservice', () => {
 
     const requestRecord = await request(timeOffServer).get(`/time-off-requests/${created.body.id}`).expect(200);
     expect(requestRecord.body.status).toBe(TimeOffRequestStatus.Pending);
+    await wait(60);
   });
 
   it('fails approval safely when HCM times out during approval', async () => {

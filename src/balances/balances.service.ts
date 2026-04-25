@@ -16,7 +16,13 @@ export interface Availability {
   lastSyncedAt: Date;
   source: BalanceSource;
   externalVersion?: string;
+  balanceAgeSeconds: number;
+  isFresh: boolean;
+  isStale: boolean;
+  staleAfterSeconds: number;
 }
+
+const DEFAULT_BALANCE_FRESHNESS_WINDOW_MS = 5 * 60 * 1000;
 
 @Injectable()
 export class BalancesService {
@@ -84,6 +90,7 @@ export class BalancesService {
       .getRawOne<{ reserved: number | string }>();
 
     const reservedHundredths = Number(raw?.reserved ?? 0);
+    const isFresh = this.isFresh(balance.lastSyncedAt);
     return {
       employeeId: balance.employeeId,
       locationId: balance.locationId,
@@ -93,6 +100,10 @@ export class BalancesService {
       lastSyncedAt: balance.lastSyncedAt,
       source: balance.source,
       externalVersion: balance.externalVersion,
+      balanceAgeSeconds: this.balanceAgeSeconds(balance.lastSyncedAt),
+      isFresh,
+      isStale: !isFresh,
+      staleAfterSeconds: this.staleAfterSeconds(),
     };
   }
 
@@ -106,10 +117,34 @@ export class BalancesService {
       lastSyncedAt: availability.lastSyncedAt,
       source: availability.source,
       externalVersion: availability.externalVersion,
+      balanceAgeSeconds: availability.balanceAgeSeconds,
+      isFresh: availability.isFresh,
+      isStale: availability.isStale,
+      staleAfterSeconds: availability.staleAfterSeconds,
     };
   }
 
   reservingStatuses() {
     return In([TimeOffRequestStatus.Pending, TimeOffRequestStatus.Approving]);
+  }
+
+  private balanceAgeSeconds(lastSyncedAt: Date): number {
+    return Math.max(0, Math.floor((Date.now() - new Date(lastSyncedAt).getTime()) / 1000));
+  }
+
+  private isFresh(lastSyncedAt: Date): boolean {
+    return Date.now() - new Date(lastSyncedAt).getTime() <= this.freshnessWindowMs();
+  }
+
+  private freshnessWindowMs(): number {
+    const configured = Number(process.env.BALANCE_FRESHNESS_WINDOW_MS);
+    if (Number.isFinite(configured) && configured >= 0) {
+      return configured;
+    }
+    return DEFAULT_BALANCE_FRESHNESS_WINDOW_MS;
+  }
+
+  private staleAfterSeconds(): number {
+    return Math.floor(this.freshnessWindowMs() / 1000);
   }
 }

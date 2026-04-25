@@ -228,13 +228,13 @@ export class HcmService {
   private async getConfig(repository = this.configs): Promise<HcmSimulatorConfig> {
     let config = await repository.findOneBy({ id: this.configId });
     if (!config) {
-      config = repository.create({
+      await repository.upsert({
         id: this.configId,
         isUnavailable: false,
         forceApplySuccess: false,
         responseDelayMs: 0,
-      });
-      config = await repository.save(config);
+      }, ['id']);
+      config = await repository.findOneByOrFail({ id: this.configId });
     }
     return config;
   }

@@ -1,7 +1,7 @@
 {
   "name": "examplehr-time-off-service",
   "version": "1.0.0",
-  "description": "ExampleHR Time-Off Microservice take-home assessment",
+  "description": "ExampleHR Time-Off Microservice",
   "private": true,
   "license": "UNLICENSED",
   "scripts": {
@@ -17,7 +17,7 @@
     "test": "jest",
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "test:cov": "jest --coverage",
-    "zip": "zip -FSr examplehr-time-off-service.zip . -x \"examplehr-time-off-service.zip\" \"node_modules/*\" \"dist/*\" \"coverage/*\" \".git/*\" \".codex\" \"data/*\" \"*.sqlite\" \"*.sqlite-*\" \".cache/*\" \"*.log\""
+    "zip": "zip -FSr examplehr-time-off-service.zip . -x \"examplehr-time-off-service.zip\" \"node_modules/*\" \"dist/*\" \"coverage/*\" \".git/*\" \".codex\" \"data/*\" \"docs/diagrams/*\" \"*.sqlite\" \"*.sqlite-*\" \".cache/*\" \"*.log\""
   },
   "dependencies": {
     "@nestjs/common": "^10.4.15",

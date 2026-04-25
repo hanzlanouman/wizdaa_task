@@ -9,19 +9,19 @@ This project implements two independently runnable NestJS services in one reposi
 - **TimeOff Service**: owns ExampleHR request lifecycle, local balance cache, reservations, audit events, and HCM batch ingestion.
 - **HCM Simulator Service**: owns simulated HCM balances, HCM realtime APIs, idempotent HCM apply behavior, outage simulation, and batch push simulation.
 
-The separation is intentional. TimeOff never imports HCM simulator repositories or entities. It calls HCM over HTTP through an HCM client, which better reflects the real system boundary described in the assignment.
+The separation is intentional. TimeOff never imports HCM simulator repositories or entities. It calls HCM over HTTP through an HCM client, which reflects the runtime boundary expected for an external HCM integration.
 
-### Assignment Alignment Summary
+### Requirements Alignment Summary
 
-| Assignment Point | Design Response |
+| Requirement | Design Response |
 |---|---|
 | HCM remains source of truth | TimeOff stores a cache only and revalidates with realtime HCM before approval |
 | ExampleHR is not the only HCM updater | realtime refresh and batch sync handle anniversary bonuses, annual refreshes, corrections, and external updates |
 | HCM realtime API exists | HCM simulator exposes realtime balance and apply APIs; TimeOff calls them over HTTP |
 | HCM batch endpoint exists | TimeOff exposes batch ingestion, and HCM simulator can push its corpus to TimeOff |
 | HCM errors may be unreliable | TimeOff checks balance before HCM apply and treats HCM/network/timeout failures as safe failures |
-| Security and architecture are evaluated | TRD documents service boundary, data ownership, idempotency, validation, timeout, and production security gaps |
-| Test suite rigor matters | e2e tests boot both services, use separate DBs, and cover failure modes and regression risks |
+| Security and architecture must be explicit | TRD documents service boundary, data ownership, idempotency, validation, timeout, and production security controls |
+| Regression safety must be demonstrable | e2e tests boot both services, use separate DBs, and cover failure modes and regression risks |
 
 ## 2. Problem Statement
 
@@ -31,6 +31,8 @@ HCM is authoritative for official balances, but ExampleHR has local pending requ
 
 A local-only CRUD service would be fast but unsafe because it could approve against stale data. An HCM-only service would miss ExampleHR pending reservations and would make every employee interaction depend on HCM availability. The system therefore needs a hybrid model: local cached balances for fast feedback, local reservations for pending requests, realtime HCM validation before approval, and batch sync for reconciliation.
 
+The product risk is not limited to approval. If an employee dashboard silently shows a stale-high cached balance, the employee can make plans from false information before submitting anything. If a manager opens an old pending request, the manager needs a fresh validation view before deciding. The design therefore separates cached workflow reads from explicit fresh HCM-backed reads.
+
 ## 3. Goals
 
 - Provide REST APIs for balance lookup, balance refresh, time-off request lifecycle, manager decisions, and HCM batch sync.
@@ -39,7 +41,7 @@ A local-only CRUD service would be fast but unsafe because it could approve agai
 - Validate with realtime HCM immediately before approval.
 - Handle HCM outages, invalid dimensions, insufficient HCM balance, stale local cache, replayed requests, and duplicate approvals safely.
 - Provide a realistic HCM simulator as a separate microservice for tests and manual verification.
-- Include a rigorous integration/e2e test suite and proof of coverage.
+- Include a rigorous integration/e2e test suite and coverage evidence.
 
 ## 4. Non-Goals
 
@@ -51,19 +53,19 @@ A local-only CRUD service would be fast but unsafe because it could approve agai
 
 ## 5. Assumptions
 
-- Balances are scoped by `employeeId + locationId`, as required by the assignment.
+- Balances are scoped by `employeeId + locationId`.
 - `days` is the source value for balance math; `startDate` and `endDate` are optional metadata.
 - HCM deducts official balance only when a manager approves a request.
 - `PENDING` and `APPROVING` ExampleHR requests reserve local availability.
 - HCM may reject invalid dimensions or insufficient balance, but TimeOff still validates defensively before apply because external guarantees may be unreliable.
-- TypeScript/NestJS satisfies the JavaScript requirement because the project compiles and runs as JavaScript.
-- SQLite and an in-process write queue are acceptable for a single-process take-home; production would use stronger shared coordination.
+- The service is implemented in TypeScript and runs as JavaScript through the standard NestJS build/runtime toolchain.
+- SQLite and an in-process write queue are used in the single-process reference implementation; production deployments would use stronger shared coordination.
 
 ## 6. User Personas
 
 - **Employee**: wants to see an accurate available balance and receive instant feedback when submitting a request.
 - **Manager**: needs to approve or reject requests knowing approval decisions use current HCM data.
-- **System operator/reviewer**: needs deterministic setup, clear tests, and failure simulations that show the architecture is intentional.
+- **System operator**: needs deterministic setup, clear tests, and failure simulations that show the architecture is intentional.
 
 ## 7. Terminology
 
@@ -84,6 +86,7 @@ A local-only CRUD service would be fast but unsafe because it could approve agai
 - TimeOff must create time-off requests when available balance is sufficient.
 - TimeOff must support create idempotency through `Idempotency-Key`.
 - TimeOff must approve, reject, cancel, list, and fetch requests.
+- TimeOff must provide a manager validation/read endpoint that refreshes HCM before showing whether a pending request is currently approvable.
 - Approval must validate current HCM balance before filing time off.
 - HCM apply must be idempotent by request ID.
 - HCM simulator must allow tests to seed balances, mutate balances, simulate invalid dimensions, simulate outages, and push batch syncs into TimeOff.
@@ -97,7 +100,7 @@ A local-only CRUD service would be fast but unsafe because it could approve agai
 - Use bounded outbound HCM HTTP calls so a slow HCM cannot hang TimeOff indefinitely.
 - Avoid duplicate HCM deductions under retries or concurrent approvals.
 - Keep setup simple: `pnpm install`, run two services, run tests.
-- Keep packaged zip under 50 MB and exclude generated/heavy folders.
+- Keep the distribution archive under 50 MB and exclude generated/heavy folders.
 
 ## 10. System Architecture
 
@@ -140,12 +143,12 @@ Source code mirrors the same ownership boundary:
 
 ### Key Architecture Decisions
 
-- **Two services, one repo**: The submission keeps setup simple while preserving the real runtime boundary: two NestJS apps, two ports, two SQLite databases, and HTTP-only integration.
+- **Two services, one repository**: The project keeps local setup simple while preserving the real runtime boundary: two NestJS apps, two ports, two SQLite databases, and HTTP-only integration.
 - **HCM as source of truth**: TimeOff never treats local cached balance as official during approval. It revalidates with realtime HCM before filing approved time off.
 - **Hybrid consistency**: Cached balances give employees fast feedback; local reservations protect pending ExampleHR requests; realtime HCM validation protects final approval; batch sync reconciles external HCM changes.
-- **Defensive integration**: TimeOff checks HCM balance before apply even though HCM may reject insufficient balance, because the assignment states HCM errors may not always be guaranteed.
+- **Defensive integration**: TimeOff checks HCM balance before apply even though HCM may reject insufficient balance, because external HCM error guarantees can be incomplete.
 - **Idempotency at boundaries**: Create requests, batch syncs, and HCM apply calls all use payload hashes or request IDs to make retries safe.
-- **SQLite tradeoff**: SQLite is used because the assignment asks for it. Explicit write transactions are serialized for deterministic single-process tests; production would use database locks or a queue with shared coordination.
+- **SQLite tradeoff**: SQLite is used for the local reference implementation. Explicit write transactions are serialized for deterministic single-process tests; production would use database locks or a queue with shared coordination.
 
 ## 11. Data Model
 
@@ -193,12 +196,13 @@ Source code mirrors the same ownership boundary:
 | Endpoint | Request | Success Response | Main Errors |
 |---|---|---|---|
 | `GET /health` | none | `{ status, service }` | none expected |
-| `GET /balances/:employeeId/:locationId` | path params | `{ employeeId, locationId, balanceDays, reservedDays, availableDays, lastSyncedAt, source, externalVersion }` | `404` no local snapshot |
-| `POST /balances/:employeeId/:locationId/refresh` | path params | same as balance response | `404` invalid HCM dimensions, `503` HCM unavailable/timeout |
+| `GET /balances/:employeeId/:locationId` | path params; optional `?fresh=true` | `{ employeeId, locationId, balanceDays, reservedDays, availableDays, lastSyncedAt, source, externalVersion, balanceAgeSeconds, isFresh, isStale, staleAfterSeconds }` | `404` no local snapshot; with `fresh=true`: `404` invalid HCM dimensions, `503` HCM unavailable/timeout |
+| `POST /balances/:employeeId/:locationId/refresh` | path params | same as balance response after realtime HCM refresh | `404` invalid HCM dimensions, `503` HCM unavailable/timeout |
 | `POST /sync/hcm/balances` | `{ batchId, balances: [{ employeeId, locationId, balanceDays, externalVersion? }] }` | `{ batchId, status, recordsReceived, recordsUpserted, idempotent }` | `400` invalid payload, `409` batch replay mismatch |
 | `POST /time-off-requests` | optional `Idempotency-Key`; `{ employeeId, locationId, days, startDate?, endDate?, reason?, requestedBy }` | request representation with `PENDING` status | `400` invalid input, `404` invalid HCM dimensions, `409` insufficient balance/idempotency conflict, `503` HCM unavailable/timeout |
 | `GET /time-off-requests` | optional `employeeId`, `locationId`, `status` query filters | request array | `400` invalid status shape |
-| `GET /time-off-requests/:id` | path param | request representation | `404` missing request |
+| `GET /time-off-requests/:id` | path param | stored workflow request representation; not final approval validation | `404` missing request |
+| `POST /time-off-requests/:id/validate` | path param | `{ request, requestedDays, hcmBalanceDays, reservedDays, availableDays, canApprove, validationReason, validatedAt, lastSyncedAt, source, isFresh, isStale }` | `404` missing request/invalid HCM dimensions, `503` HCM unavailable/timeout |
 | `POST /time-off-requests/:id/approve` | `{ managerId }` | approved request representation | `404` missing request, `409` invalid transition/insufficient HCM balance, `503` HCM unavailable/timeout |
 | `POST /time-off-requests/:id/reject` | `{ managerId, reason? }` | rejected request representation | `404` missing request, `409` invalid transition |
 | `POST /time-off-requests/:id/cancel` | `{ actorId, reason? }` | cancelled request representation | `404` missing request, `409` invalid transition |
@@ -286,7 +290,8 @@ sequenceDiagram
 - Store day amounts as integer hundredths to avoid floating point drift.
 - Calculate availability as `cached HCM balance - PENDING reservations - APPROVING reservations`.
 - Seed missing local cache from realtime HCM during request creation.
-- If local availability is too low, refresh from HCM once before rejecting.
+- Refresh realtime HCM before request creation so stale high cache cannot register a request that HCM would immediately make invalid.
+- If local availability is too low after refresh, reject without creating a request.
 - Validate realtime HCM balance before approval.
 - Apply time off to HCM only after approval lock is acquired.
 - Update local cache from HCM apply result after approval succeeds.
@@ -294,12 +299,29 @@ sequenceDiagram
 - Keep create idempotent by `Idempotency-Key + payloadHash`.
 - Do not auto-cancel pending requests if HCM batch sync lowers balances; approval revalidates with HCM.
 
+### Employee and Manager Balance Freshness
+
+Employee-facing balance display must not silently rely on stale cache. The fast cached read, `GET /balances/:employeeId/:locationId`, includes `lastSyncedAt`, `source`, `balanceAgeSeconds`, `isFresh`, `isStale`, and `staleAfterSeconds`. The freshness window defaults to five minutes and can be adjusted with `BALANCE_FRESHNESS_WINDOW_MS`.
+
+Dashboard, request-form, and manager review screens should request fresh data with either `GET /balances/:employeeId/:locationId?fresh=true` or `POST /balances/:employeeId/:locationId/refresh`. Both paths call realtime HCM first, update the local cache, and return:
+
+```text
+availableDays = latest HCM balance - PENDING reservations - APPROVING reservations
+```
+
+This prevents the product problem where TimeOff cache says `20` days while HCM has been externally corrected to `0` days. If HCM is unavailable for a display refresh, the service fails the fresh read with `503` rather than marking stale data as current. A production UI may choose to separately show the last cached snapshot, but it must label it as stale using `isStale`, `balanceAgeSeconds`, and `lastSyncedAt`.
+
+`GET /time-off-requests/:id` returns stored workflow state. It intentionally does not claim the request is still approvable, because HCM may have changed since creation. Manager review screens should call `POST /time-off-requests/:id/validate`, which refreshes HCM, updates the local cache, and returns `canApprove` plus a validation reason without changing request status.
+
+Business actions are stricter than display. `POST /time-off-requests` refreshes HCM before creating a `PENDING` request, and approval revalidates HCM again before applying time off. Therefore, an employee does not get a misleading successful request creation from stale high cache, and a manager cannot approve based only on a two-day-old local snapshot.
+
 ## 15. HCM Integration Model
 
 Realtime HCM APIs are used for:
 
 - Missing local cache refresh.
 - Stale low-cache refresh before request rejection.
+- Employee dashboard, request-form, and manager validation views.
 - Approval-time official balance validation.
 - Filing approved time off.
 
@@ -315,23 +337,24 @@ The HCM simulator exposes both models. `POST /hcm-simulator/batch-push` lets the
 
 ```mermaid
 sequenceDiagram
-    participant H as HCM Simulator
+    autonumber
+    participant HCM as HCM Simulator
     participant TimeOff as TimeOff Service
     participant DB as TimeOff DB
 
-    H->>TimeOff: POST /sync/hcm/balances { batchId, balances[] }
+    HCM->>TimeOff: POST /sync/hcm/balances { batchId, balances[] }
     TimeOff->>TimeOff: Normalize + sort payload
     TimeOff->>TimeOff: Compute payloadHash
     TimeOff->>DB: Check existing balance_sync_events by batchId
 
     alt Same batchId + same payloadHash
-        TimeOff-->>H: 201 idempotent success
+        TimeOff-->>HCM: 201 idempotent success
     else Same batchId + different payloadHash
-        TimeOff-->>H: 409 Conflict
+        TimeOff-->>HCM: 409 Conflict
     else New batch
         TimeOff->>DB: Upsert balances by employeeId + locationId
         TimeOff->>DB: Write balance_sync_event
-        TimeOff-->>H: 201 sync success
+        TimeOff-->>HCM: 201 sync success
     end
 ```
 
@@ -342,6 +365,10 @@ sequenceDiagram
 - **HCM realtime API timeout**: abort the outbound HCM call, return `503`, and do not create or approve the request.
 - **Invalid HCM dimension**: return `404`; do not seed local cache.
 - **Insufficient local availability**: refresh from HCM once; return `409` only if still insufficient.
+- **Stale high cache during request creation**: refresh HCM before creating; if HCM is lower than the requested days, return `409` and create no `PENDING` request.
+- **Stale dashboard or manager review balance**: fresh balance reads call realtime HCM; cached reads include age and freshness metadata so stale values are not presented as current.
+- **Manager opens old request after HCM changed**: `POST /time-off-requests/:id/validate` refreshes HCM and returns `canApprove=false` when the request is no longer backed by official balance.
+- **HCM unavailable during manager validation**: return `503`; do not change request state.
 - **HCM balance decreases before approval**: return `409`, revert `APPROVING` to `PENDING`, and do not apply to HCM.
 - **HCM unavailable during approval**: return `503`, revert `APPROVING` to `PENDING`, and keep request retryable.
 - **Duplicate approval attempt**: only one caller can enter `APPROVING`; the other receives conflict or the already-approved request.
@@ -356,12 +383,13 @@ sequenceDiagram
 - DTO validation is enabled globally with whitelist and non-whitelisted-field rejection.
 - Day values are validated and stored as integer hundredths to avoid floating point drift and malformed balance math.
 - TimeOff uses outbound HCM HTTP timeouts through `HCM_TIMEOUT_MS` to avoid request exhaustion from slow dependencies.
+- Freshness metadata is included on cached balance responses so user interfaces do not accidentally present stale HCM data as current.
 - HCM simulator endpoints are test/development endpoints and should not be exposed publicly in production.
 - Actor fields are audit metadata only; production would require authentication and manager authorization.
 - No secrets are committed.
 - Errors use NestJS HTTP exceptions rather than raw stack traces.
 - Production HCM HTTP calls would require TLS, credentials, request signing or OAuth, retries, circuit breakers, and structured logging.
-- The simulator batch push target is environment-controlled for this take-home; production systems should avoid arbitrary callback targets.
+- The simulator batch push target is environment-controlled for local development; production systems should avoid arbitrary callback targets.
 - Production should restrict CORS, add rate limiting, protect write endpoints, and store secrets in a secret manager rather than environment files.
 
 ## 18. Testing Strategy
@@ -379,6 +407,9 @@ Tests verify:
 - HCM simulator batch push into TimeOff.
 - Cached, reserved, and available balance calculations.
 - Missing and stale local cache refresh.
+- Stale high-cache request creation rejection.
+- Employee display freshness metadata and fresh read behavior.
+- Manager validation before approval.
 - HCM outage, timeout, and network unreachability.
 - Invalid dimensions and validation failures.
 - Idempotent create and HCM apply.
@@ -401,9 +432,10 @@ The chosen design is intentionally hybrid. It gives employees fast local feedbac
 ## 20. Known Limitations
 
 - No production authentication or authorization.
-- No database migrations; TypeORM `synchronize: true` is used for take-home simplicity.
+- No database migrations; TypeORM `synchronize: true` is used for local development speed.
 - SQLite and in-process write serialization are not suitable for horizontally scaled production writes.
 - No stale `APPROVING` recovery job after process crash.
+- Pending requests are not automatically marked as balance-risk after a batch sync lowers availability; manager validation and approval-time checks catch the risk before approval.
 - No vendor-specific HCM retry/backoff policy.
 - No leave type, holiday, weekend, or accrual policy engine.
 
@@ -412,6 +444,7 @@ The chosen design is intentionally hybrid. It gives employees fast local feedbac
 - Add JWT/session authentication and manager authorization.
 - Replace `synchronize: true` with migrations.
 - Add approval lease timeout and recovery for abandoned `APPROVING` requests.
+- Mark pending requests as balance-risk when batch sync lowers HCM balance below existing pending reservations.
 - Add production HCM adapter with retries, circuit breaker, and structured observability.
 - Add leave types, calendars, accrual policies, and approval reversal workflows.
 - Add OpenAPI documentation for both services.

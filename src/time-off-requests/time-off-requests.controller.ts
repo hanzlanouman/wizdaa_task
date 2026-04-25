@@ -35,6 +35,11 @@ export class TimeOffRequestsController {
     return this.requests.formatRequest(await this.requests.findOne(id));
   }
 
+  @Post(':id/validate')
+  async validate(@Param('id') id: string) {
+    return this.requests.formatValidation(await this.requests.validate(id));
+  }
+
   @Post(':id/approve')
   async approve(@Param('id') id: string, @Body() dto: ApproveTimeOffRequestDto) {
     return this.requests.formatRequest(await this.requests.approve(id, dto.managerId));

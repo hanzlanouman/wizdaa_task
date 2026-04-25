@@ -22,6 +22,14 @@ interface CreateAttemptResult {
   insufficient?: boolean;
 }
 
+interface RequestValidation {
+  request: TimeOffRequest;
+  availability: Awaited<ReturnType<BalancesService['refreshFromHcm']>>;
+  canApprove: boolean;
+  validationReason: string;
+  validatedAt: Date;
+}
+
 @Injectable()
 export class TimeOffRequestsService {
   constructor(
@@ -49,18 +57,9 @@ export class TimeOffRequestsService {
       }
     }
 
-    let balance = await this.balancesService.getBalanceEntity(dto.employeeId, dto.locationId);
-    if (!balance) {
-      await this.balancesService.refreshFromHcm(dto.employeeId, dto.locationId);
-    }
+    await this.balancesService.refreshFromHcm(dto.employeeId, dto.locationId);
 
     let result = await this.tryCreate(dto, daysHundredths, idempotencyKey, payloadHash);
-    if (result.request) {
-      return result.request;
-    }
-
-    await this.balancesService.refreshFromHcm(dto.employeeId, dto.locationId);
-    result = await this.tryCreate(dto, daysHundredths, idempotencyKey, payloadHash);
     if (result.request) {
       return result.request;
     }
@@ -89,6 +88,28 @@ export class TimeOffRequestsService {
       throw new NotFoundException('Time-off request was not found');
     }
     return request;
+  }
+
+  async validate(id: string): Promise<RequestValidation> {
+    const request = await this.findOne(id);
+    const availability = await this.balancesService.refreshFromHcm(request.employeeId, request.locationId);
+    const statusAllowsApproval = request.status === TimeOffRequestStatus.Pending;
+    const hcmHasBalance = availability.balanceHundredths >= request.daysHundredths;
+
+    let validationReason = 'HCM balance is sufficient for this request';
+    if (!statusAllowsApproval) {
+      validationReason = `Cannot approve a ${request.status} request`;
+    } else if (!hcmHasBalance) {
+      validationReason = 'HCM balance is insufficient for this request';
+    }
+
+    return {
+      request,
+      availability,
+      canApprove: statusAllowsApproval && hcmHasBalance,
+      validationReason,
+      validatedAt: new Date(),
+    };
   }
 
   async approve(id: string, managerId: string): Promise<TimeOffRequest> {
@@ -214,6 +235,29 @@ export class TimeOffRequestsService {
       hcmTransactionId: request.hcmTransactionId,
       createdAt: request.createdAt,
       updatedAt: request.updatedAt,
+    };
+  }
+
+  formatValidation(validation: RequestValidation) {
+    return {
+      request: this.formatRequest(validation.request),
+      employeeId: validation.request.employeeId,
+      locationId: validation.request.locationId,
+      status: validation.request.status,
+      requestedDays: hundredthsToDays(validation.request.daysHundredths),
+      hcmBalanceDays: hundredthsToDays(validation.availability.balanceHundredths),
+      reservedDays: hundredthsToDays(validation.availability.reservedHundredths),
+      availableDays: hundredthsToDays(validation.availability.availableHundredths),
+      lastSyncedAt: validation.availability.lastSyncedAt,
+      source: validation.availability.source,
+      externalVersion: validation.availability.externalVersion,
+      balanceAgeSeconds: validation.availability.balanceAgeSeconds,
+      isFresh: validation.availability.isFresh,
+      isStale: validation.availability.isStale,
+      staleAfterSeconds: validation.availability.staleAfterSeconds,
+      canApprove: validation.canApprove,
+      validationReason: validation.validationReason,
+      validatedAt: validation.validatedAt,
     };
   }
 

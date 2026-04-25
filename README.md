@@ -2,16 +2,16 @@
 
 ExampleHR Time-Off Microservice is a NestJS + SQLite backend for managing employee time-off requests while treating an external HCM system, such as Workday or SAP, as the source of truth for official balances.
 
-The submission runs as two separate services in one repo:
+The system runs as two separate services in one repository:
 
 - **TimeOff Service**: request lifecycle, cached balances, reservations, approval workflow, audit, and HCM batch ingestion.
 - **HCM Simulator Service**: separate mock HCM service for realtime balance, apply time off, outage simulation, external balance changes, and batch push simulation.
 
 TimeOff does not import HCM simulator modules/entities or share HCM tables. It calls HCM over HTTP through `HCM_BASE_URL`.
 
-## JavaScript Requirement
+## Runtime and Language
 
-The implementation uses NestJS with TypeScript because NestJS is TypeScript-first. It compiles and runs as JavaScript through the normal Nest build/runtime toolchain.
+The implementation uses NestJS with TypeScript because NestJS is TypeScript-first. It compiles and runs as JavaScript through the standard Nest build/runtime toolchain.
 
 ## Prerequisites
 
@@ -69,7 +69,7 @@ pnpm test:e2e
 pnpm test:cov
 ```
 
-The e2e suite boots both services on random ports, gives each service its own in-memory SQLite database, and verifies the HTTP integration boundary. Focused unit tests cover day conversion and stable hashing utilities. Coverage proof is summarized in [docs/COVERAGE_SUMMARY.md](docs/COVERAGE_SUMMARY.md).
+The e2e suite boots both services on random ports, gives each service its own in-memory SQLite database, and verifies the HTTP integration boundary. Focused unit tests cover day conversion and stable hashing utilities. Coverage evidence is summarized in [docs/COVERAGE_SUMMARY.md](docs/COVERAGE_SUMMARY.md).
 
 ## Requirement Alignment
 
@@ -109,6 +109,12 @@ cached HCM balance - PENDING reservations - APPROVING reservations
 
 HCM remains authoritative. Local balance is only a cached snapshot used for fast feedback. Approval always validates against realtime HCM before applying time off.
 
+Employee and manager balance screens should use `GET /balances/:employeeId/:locationId?fresh=true` or `POST /balances/:employeeId/:locationId/refresh` so the displayed balance is pulled from realtime HCM first. Plain `GET /balances/:employeeId/:locationId` is a cached read and includes `lastSyncedAt`, `source`, `balanceAgeSeconds`, `isFresh`, `isStale`, and `staleAfterSeconds` so stale snapshots are not silently presented as current.
+
+Request creation also refreshes from HCM before creating a `PENDING` request. If local cache says 10 days but HCM has been externally corrected to 2 days, an 8-day request returns `409` and no request is registered.
+
+Manager review screens can call `POST /time-off-requests/:id/validate` before approval. It refreshes HCM, returns `canApprove` and a validation reason, and does not mutate the request state. `GET /time-off-requests/:id` remains a stored workflow read, while approval itself is still the authoritative final validation point.
+
 Approval uses a transient `APPROVING` status before calling HCM. This prevents duplicate approval requests from double-deducting the same request. The HCM simulator also records applied `requestId` values so repeated HCM apply calls are idempotent.
 
 Balances are scoped per employee/location. The `balances` table has a unique `(employeeId, locationId)` constraint, and every request, reservation calculation, refresh, approval, and sync operation uses both dimensions.
@@ -130,6 +136,7 @@ Balances are scoped per employee/location. The `balances` table has a unique `(e
 - `POST /time-off-requests`
 - `GET /time-off-requests`
 - `GET /time-off-requests/:id`
+- `POST /time-off-requests/:id/validate`
 - `POST /time-off-requests/:id/approve`
 - `POST /time-off-requests/:id/reject`
 - `POST /time-off-requests/:id/cancel`
@@ -154,6 +161,12 @@ curl -X PUT http://localhost:3001/hcm-simulator/balances/emp-1/loc-1 \
   -d '{"balanceDays":10}'
 ```
 
+Read a fresh employee-facing balance:
+
+```bash
+curl "http://localhost:3000/balances/emp-1/loc-1?fresh=true"
+```
+
 Create a request through TimeOff:
 
 ```bash
@@ -161,6 +174,12 @@ curl -X POST http://localhost:3000/time-off-requests \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: create-emp-1-001' \
   -d '{"employeeId":"emp-1","locationId":"loc-1","days":2,"requestedBy":"emp-1","reason":"Vacation"}'
+```
+
+Validate the request for a manager review screen:
+
+```bash
+curl -X POST http://localhost:3000/time-off-requests/<request-id>/validate
 ```
 
 Approve the request:
@@ -191,7 +210,7 @@ curl -X POST http://localhost:3001/hcm-simulator/config \
 
 - [docs/TRD.md](docs/TRD.md): technical requirements document.
 - [docs/TEST_PLAN.md](docs/TEST_PLAN.md): test strategy and matrix.
-- [docs/COVERAGE_SUMMARY.md](docs/COVERAGE_SUMMARY.md): latest coverage proof.
+- [docs/COVERAGE_SUMMARY.md](docs/COVERAGE_SUMMARY.md): latest coverage evidence.
 
 ## Assumptions and Non-goals
 
@@ -199,14 +218,14 @@ curl -X POST http://localhost:3001/hcm-simulator/config \
 - TimeOff owns local request workflow and reservations.
 - Real authentication, JWT/session handling, and manager hierarchy are out of scope.
 - Leave types, holidays, weekends, accrual policies, and approval reversal are out of scope.
-- TypeORM `synchronize: true` is used for take-home simplicity; production would use migrations.
+- TypeORM `synchronize: true` is used for local development speed; production deployments would use migrations.
 
 ## Packaging
 
-Create a submission zip with:
+Create a distribution archive with:
 
 ```bash
 pnpm run zip
 ```
 
-The zip script excludes `node_modules`, `dist`, `coverage`, `.git`, local DB files, logs, and caches. The final zip should stay well under the 50 MB limit.
+The archive script excludes `node_modules`, `dist`, `coverage`, `.git`, local DB files, logs, and caches. The resulting package stays well under the 50 MB distribution limit.
