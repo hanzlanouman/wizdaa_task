@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+data/
+*.sqlite
+*.sqlite-*
+*.log
+.cache/
+.DS_Store
+examplehr-time-off-service.zip
