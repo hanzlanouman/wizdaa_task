@@ -103,26 +103,31 @@ A local-only CRUD service would be fast but unsafe because it could approve agai
 
 The system has two service processes:
 
-```text
-Employee/Manager/API Client
-        |
-        v
-TimeOff Service :3000
-  - request lifecycle
-  - local balance cache
-  - reservations
-  - audit and sync history
-  - SQLite: time-off.sqlite
-        |
-        | HTTP via HCM_BASE_URL
-        v
-HCM Simulator Service :3001
-  - official simulated HCM balance state
-  - realtime balance API
-  - time-off apply API
-  - failure simulation
-  - batch push simulation
-  - SQLite: hcm-simulator.sqlite
+```mermaid
+flowchart LR
+    Client[Employee / Manager / API Client]
+
+    subgraph TimeOff["TimeOff Service :3000"]
+        TO_API[REST API]
+        TO_App[Request Lifecycle<br/>Balance Cache<br/>Reservations<br/>Audit + Sync]
+        TO_DB[(SQLite<br/>time-off.sqlite)]
+    end
+
+    subgraph HCM["HCM Simulator Service :3001"]
+        HCM_API[Realtime + Apply APIs]
+        HCM_App[Simulated Official Balances<br/>Outage / Timeout Simulation<br/>Batch Push]
+        HCM_DB[(SQLite<br/>hcm-simulator.sqlite)]
+    end
+
+    Client --> TO_API
+    TO_API --> TO_App
+    TO_App --> TO_DB
+
+    TO_App -- "HTTP via HCM_BASE_URL" --> HCM_API
+    HCM_API --> HCM_App
+    HCM_App --> HCM_DB
+
+    HCM_App -- "Batch push" --> TO_API
 ```
 
 TimeOff owns no HCM simulator tables. HCM owns no TimeOff request or sync tables. This is verified by e2e tests.
@@ -227,32 +232,52 @@ Terminal states:
 
 `APPROVING` is a transient lock state. Only the request that successfully moves from `PENDING` to `APPROVING` may call HCM apply.
 
+### Lifecycle State Diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: create request
+
+    PENDING --> APPROVING: manager approves
+    APPROVING --> APPROVED: HCM validation + apply succeeds
+    APPROVING --> PENDING: HCM unavailable / insufficient / timeout
+
+    PENDING --> REJECTED: manager rejects
+    PENDING --> CANCELLED: employee/actor cancels
+
+    APPROVED --> [*]
+    REJECTED --> [*]
+    CANCELLED --> [*]
+```
+
 ### Approval Sequence
 
 ```mermaid
 sequenceDiagram
-    participant E as Employee/Manager
-    participant T as TimeOff Service
-    participant H as HCM Simulator
+    autonumber
+    participant Manager
+    participant TimeOff as TimeOff Service
     participant DB as TimeOff DB
+    participant HCM as HCM Simulator
 
-    E->>T: POST /time-off-requests
-    T->>H: GET realtime balance if cache missing/stale-low
-    H-->>T: official balance
-    T->>DB: create PENDING request and reserve days
-    T-->>E: 201 PENDING
-
-    E->>T: POST /time-off-requests/:id/approve
-    T->>DB: PENDING -> APPROVING lock
-    T->>H: GET realtime balance
-    alt HCM has enough balance
-        T->>H: POST /hcm-simulator/time-off with requestId
-        H-->>T: hcmTransactionId and resulting balance
-        T->>DB: update cache, APPROVING -> APPROVED
-        T-->>E: 201 APPROVED
-    else HCM unavailable, timeout, or insufficient
-        T->>DB: APPROVING -> PENDING
-        T-->>E: 409 or 503 safe failure
+    Manager->>TimeOff: POST /time-off-requests/:id/approve
+    TimeOff->>DB: Atomically move PENDING -> APPROVING
+    alt Request not PENDING
+        TimeOff-->>Manager: 409 conflict or existing approved request
+    else Lock acquired
+        TimeOff->>HCM: GET /hcm-simulator/balances/:employeeId/:locationId
+        alt HCM unavailable / timeout
+            TimeOff->>DB: APPROVING -> PENDING + audit event
+            TimeOff-->>Manager: 503 Service Unavailable
+        else HCM balance insufficient
+            TimeOff->>DB: APPROVING -> PENDING + audit event
+            TimeOff-->>Manager: 409 Conflict
+        else HCM balance sufficient
+            TimeOff->>HCM: POST /hcm-simulator/time-off with requestId
+            HCM-->>TimeOff: hcmTransactionId + resulting balance
+            TimeOff->>DB: Update local cache + mark APPROVED + audit event
+            TimeOff-->>Manager: 201 Approved
+        end
     end
 ```
 
@@ -290,21 +315,24 @@ The HCM simulator exposes both models. `POST /hcm-simulator/batch-push` lets the
 
 ```mermaid
 sequenceDiagram
-    participant External as HCM Event/Operator
     participant H as HCM Simulator
-    participant T as TimeOff Service
+    participant TimeOff as TimeOff Service
     participant DB as TimeOff DB
 
-    External->>H: update balance for employee/location
-    H->>T: POST /sync/hcm/balances
-    T->>DB: upsert cached balance by employeeId + locationId
-    T-->>H: recordsReceived, recordsUpserted, idempotent
+    H->>TimeOff: POST /sync/hcm/balances { batchId, balances[] }
+    TimeOff->>TimeOff: Normalize + sort payload
+    TimeOff->>TimeOff: Compute payloadHash
+    TimeOff->>DB: Check existing balance_sync_events by batchId
 
-    External->>T: POST /balances/:employeeId/:locationId/refresh
-    T->>H: GET realtime balance
-    H-->>T: official current balance
-    T->>DB: update local cache
-    T-->>External: balance, reserved, available
+    alt Same batchId + same payloadHash
+        TimeOff-->>H: 201 idempotent success
+    else Same batchId + different payloadHash
+        TimeOff-->>H: 409 Conflict
+    else New batch
+        TimeOff->>DB: Upsert balances by employeeId + locationId
+        TimeOff->>DB: Write balance_sync_event
+        TimeOff-->>H: 201 sync success
+    end
 ```
 
 ## 16. Failure Modes and Handling
