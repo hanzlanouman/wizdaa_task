@@ -2,31 +2,33 @@
 
 ExampleHR Time-Off Microservice is a NestJS + SQLite backend for managing employee time-off requests while treating an external HCM system, such as Workday or SAP, as the source of truth for official balances.
 
+Repository: https://github.com/hanzlanouman/wizdaa_task/
+
 The system runs as two separate services in one repository:
 
-- **TimeOff Service**: request lifecycle, cached balances, reservations, approval workflow, audit, and HCM batch ingestion.
-- **HCM Simulator Service**: separate mock HCM service for realtime balance, apply time off, outage simulation, external balance changes, and batch push simulation.
+- **TimeOff Service**: request lifecycle, cached balances, reservations, approval workflow, audit events, and HCM batch ingestion.
+- **HCM Simulator Service**: separate mock HCM service for realtime balance lookup, time-off apply, outage simulation, external balance changes, and batch push simulation.
 
 TimeOff does not import HCM simulator modules/entities or share HCM tables. It calls HCM over HTTP through `HCM_BASE_URL`.
 
-## Runtime and Language
+## Documentation
 
-The implementation uses NestJS with TypeScript because NestJS is TypeScript-first. It compiles and runs as JavaScript through the standard Nest build/runtime toolchain.
+- [docs/TRD.md](docs/TRD.md): engineering specification, architecture decisions, API design, failure modes, security considerations, alternatives, and future improvements.
+- [docs/TEST_PLAN.md](docs/TEST_PLAN.md): test strategy and scenario matrix.
+- [docs/COVERAGE_SUMMARY.md](docs/COVERAGE_SUMMARY.md): latest coverage summary.
 
-## Prerequisites
+## Runtime
 
 - Node.js 22+
 - pnpm 10+
 
-Node 22+ is required for the tested runtime and native `fetch`/`AbortController` support used by the HCM HTTP client.
+The implementation uses NestJS with TypeScript because NestJS is TypeScript-first. It compiles and runs as JavaScript through the standard Nest build/runtime toolchain.
 
 ## Install
 
 ```bash
 pnpm install
 ```
-
-The project includes pnpm build approval for `sqlite3`, so install should build the native SQLite binding automatically.
 
 ## Run Locally
 
@@ -42,7 +44,7 @@ Run the TimeOff service in another terminal:
 HCM_BASE_URL=http://localhost:3001 pnpm run start:dev:timeoff
 ```
 
-Defaults:
+Default local configuration:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -54,7 +56,7 @@ Defaults:
 | `TIMEOFF_DB_PATH` | `data/time-off.sqlite` | TimeOff SQLite path |
 | `HCM_DB_PATH` | `data/hcm-simulator.sqlite` | HCM simulator SQLite path |
 
-Production-style compiled run:
+Compiled run:
 
 ```bash
 pnpm run build
@@ -62,94 +64,22 @@ pnpm run start:prod:hcm
 HCM_BASE_URL=http://localhost:3001 pnpm run start:prod:timeoff
 ```
 
-## Test
+## Verify
 
 ```bash
+pnpm run build
+pnpm test
 pnpm test:e2e
 pnpm test:cov
 ```
 
-The e2e suite boots both services on random ports, gives each service its own in-memory SQLite database, and verifies the HTTP integration boundary. Focused unit tests cover day conversion and stable hashing utilities. Coverage evidence is summarized in [docs/COVERAGE_SUMMARY.md](docs/COVERAGE_SUMMARY.md).
+Create the distribution archive:
 
-## Requirement Alignment
-
-- **HCM source of truth**: TimeOff stores only cached HCM balances and always revalidates with HCM before approval.
-- **External HCM changes**: realtime refresh and batch sync handle work anniversary bonuses, annual refreshes, corrections, and other non-ExampleHR updates.
-- **Realtime HCM API**: TimeOff calls HCM over HTTP for balance refresh and approved time-off filing.
-- **Batch HCM endpoint**: TimeOff exposes `POST /sync/hcm/balances`, and HCM simulator exposes `POST /hcm-simulator/batch-push`.
-- **Defensive HCM handling**: TimeOff checks balance before apply, handles HCM invalid dimensions, insufficient balance, outages, network failure, and timeouts.
-- **Test rigor**: e2e tests prove service separation, DB separation, idempotency, stale cache refresh, HCM failures, approval safety, and audit persistence.
-
-## Architecture
-
-- `AppModule`: TimeOff service only.
-- `HcmSimulatorAppModule`: HCM simulator service only.
-- `BalancesModule`: cached balances, HCM refresh, available balance calculation.
-- `TimeOffRequestsModule`: request creation, approval, rejection, cancellation, and idempotency.
-- `SyncModule`: HCM batch sync with payload-hash idempotency.
-- `AuditModule`: request lifecycle audit events.
-- `HcmClientModule`: TimeOff HTTP client for HCM realtime APIs.
-- `HcmModule`: HCM simulator balance/apply/config/batch-push endpoints.
-
-Database entity code is also grouped by ownership:
-
-- `src/database/timeoff/`: TimeOff balance, request, audit, and sync entities.
-- `src/database/hcm-simulator/`: HCM simulator balance, apply, and config entities.
-- `src/database/entities.ts`: shared export boundary that provides separate entity lists to each app module.
-
-Days are stored internally as integer hundredths to avoid floating point drift. For example, `1.50` days is stored as `150`.
-
-## Core Balance Strategy
-
-Available balance is calculated as:
-
-```text
-cached HCM balance - PENDING reservations - APPROVING reservations
+```bash
+pnpm run zip
 ```
 
-HCM remains authoritative. Local balance is only a cached snapshot used for fast feedback. Approval always validates against realtime HCM before applying time off.
-
-Employee and manager balance screens should use `GET /balances/:employeeId/:locationId?fresh=true` or `POST /balances/:employeeId/:locationId/refresh` so the displayed balance is pulled from realtime HCM first. Plain `GET /balances/:employeeId/:locationId` is a cached read and includes `lastSyncedAt`, `source`, `balanceAgeSeconds`, `isFresh`, `isStale`, and `staleAfterSeconds` so stale snapshots are not silently presented as current.
-
-Request creation also refreshes from HCM before creating a `PENDING` request. If local cache says 10 days but HCM has been externally corrected to 2 days, an 8-day request returns `409` and no request is registered.
-
-Manager review screens can call `POST /time-off-requests/:id/validate` before approval. It refreshes HCM, returns `canApprove` and a validation reason, and does not mutate the request state. `GET /time-off-requests/:id` remains a stored workflow read, while approval itself is still the authoritative final validation point.
-
-Approval uses a transient `APPROVING` status before calling HCM. This prevents duplicate approval requests from double-deducting the same request. The HCM simulator also records applied `requestId` values so repeated HCM apply calls are idempotent.
-
-Balances are scoped per employee/location. The `balances` table has a unique `(employeeId, locationId)` constraint, and every request, reservation calculation, refresh, approval, and sync operation uses both dimensions.
-
-## Security and Architecture Notes
-
-- DTO validation uses whitelist mode and rejects non-whitelisted fields.
-- HCM calls are bounded by `HCM_TIMEOUT_MS` so slow dependencies do not hang TimeOff.
-- Request creation, HCM batch sync, and HCM apply are idempotent to make retries safe.
-- The HCM simulator is a development/test service and should not be exposed publicly in production.
-- Actor fields are audit metadata only; production would add authentication, manager authorization, TLS, HCM credentials/OAuth, rate limiting, structured logs, and database migrations.
-
-## TimeOff API
-
-- `GET /health`
-- `GET /balances/:employeeId/:locationId`
-- `POST /balances/:employeeId/:locationId/refresh`
-- `POST /sync/hcm/balances`
-- `POST /time-off-requests`
-- `GET /time-off-requests`
-- `GET /time-off-requests/:id`
-- `POST /time-off-requests/:id/validate`
-- `POST /time-off-requests/:id/approve`
-- `POST /time-off-requests/:id/reject`
-- `POST /time-off-requests/:id/cancel`
-
-## HCM Simulator API
-
-- `GET /health`
-- `GET /hcm-simulator/balances/:employeeId/:locationId`
-- `PUT /hcm-simulator/balances/:employeeId/:locationId`
-- `POST /hcm-simulator/time-off`
-- `POST /hcm-simulator/config`
-- `POST /hcm-simulator/batch-push`
-- `POST /hcm-simulator/reset`
+The archive script excludes `node_modules`, `dist`, `coverage`, `.git`, local DB files, logs, caches, and SQLite files.
 
 ## Example Flow
 
@@ -197,35 +127,3 @@ curl -X POST http://localhost:3001/hcm-simulator/batch-push \
   -H 'Content-Type: application/json' \
   -d '{"batchId":"hcm-batch-001"}'
 ```
-
-Simulate HCM outage:
-
-```bash
-curl -X POST http://localhost:3001/hcm-simulator/config \
-  -H 'Content-Type: application/json' \
-  -d '{"isUnavailable":true}'
-```
-
-## Docs
-
-- [docs/TRD.md](docs/TRD.md): technical requirements document.
-- [docs/TEST_PLAN.md](docs/TEST_PLAN.md): test strategy and matrix.
-- [docs/COVERAGE_SUMMARY.md](docs/COVERAGE_SUMMARY.md): latest coverage evidence.
-
-## Assumptions and Non-goals
-
-- HCM is the source of truth for official balances.
-- TimeOff owns local request workflow and reservations.
-- Real authentication, JWT/session handling, and manager hierarchy are out of scope.
-- Leave types, holidays, weekends, accrual policies, and approval reversal are out of scope.
-- TypeORM `synchronize: true` is used for local development speed; production deployments would use migrations.
-
-## Packaging
-
-Create a distribution archive with:
-
-```bash
-pnpm run zip
-```
-
-The archive script excludes `node_modules`, `dist`, `coverage`, `.git`, local DB files, logs, and caches. The resulting package stays well under the 50 MB distribution limit.
